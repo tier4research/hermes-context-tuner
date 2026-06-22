@@ -137,16 +137,18 @@ class ContextTunerEngine:
         return status
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
+        # Hermes ContextEngine.get_tool_schemas() returns the *inner* function
+        # schema. agent_init wraps each entry as {"type": "function", "function": schema}.
+        # Returning an already OpenAI-wrapped schema here creates a malformed
+        # double-wrap (`tools[n].function` has no `name`), which strict
+        # providers such as opencode-go / DeepSeek reject.
         return [
             {
-                "type": "function",
-                "function": {
-                    "name": "context_tuner_status",
-                    "description": "Show Hermes Context Tuner compression/audit status and recent recovery pointers.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"limit": {"type": "integer", "default": 5}},
-                    },
+                "name": "context_tuner_status",
+                "description": "Show Hermes Context Tuner compression/audit status and recent recovery pointers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer", "default": 5}},
                 },
             }
         ]
