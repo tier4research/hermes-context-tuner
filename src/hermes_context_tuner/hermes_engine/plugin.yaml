@@ -1,0 +1,4 @@
+name: context-tuner
+version: 0.1.0-alpha.1
+description: Upgrade-resilient wrapper around Hermes' built-in context compressor with budget plans and recovery-pointer audits.
+author: Tier 4 Research

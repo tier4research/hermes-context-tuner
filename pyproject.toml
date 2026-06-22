@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-context-tuner"
+version = "0.1.0-alpha.1"
+description = "Upgrade-resilient context optimization engine for Hermes Agent."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{name = "Tier 4 Research", email = "mjohnson@novacoresystems.com"}]
+keywords = ["hermes-agent", "context", "compression", "ai-agents", "prompt-budget"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/tier4research/hermes-context-tuner"
+Repository = "https://github.com/tier4research/hermes-context-tuner"
+Issues = "https://github.com/tier4research/hermes-context-tuner/issues"
+
+[project.scripts]
+hermes-context-tuner = "hermes_context_tuner.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_context_tuner"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
