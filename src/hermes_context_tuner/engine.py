@@ -9,6 +9,20 @@ from typing import Any
 from .budget import build_budget_plan
 from .recovery import RecoveryPointerStore
 
+class DelegateCompressionError(RuntimeError):
+    """Hermes' compressor raised while executing a valid contract call."""
+
+def _invoke_compatible(fn: Any, candidates: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> Any:
+    """Select a valid frozen contract before invocation; never retry body errors."""
+    signature = inspect.signature(fn)
+    for args, kwargs in candidates:
+        try:
+            signature.bind(*args, **kwargs)
+        except TypeError:
+            continue
+        return fn(*args, **kwargs)
+    raise TypeError(f"unsupported Hermes delegate signature: {signature}")
+
 
 def default_store_path() -> Path:
     home = os.environ.get("HERMES_HOME") or os.path.join(Path.home(), ".hermes")
@@ -46,13 +60,13 @@ class ContextTunerEngine:
         self._store = RecoveryPointerStore(default_store_path())
         self._last_plan = None
         self._session_id = ""
+        self._pending_operation: str | None = None
+        self._pending_count = 0
+        self._health = {"audit_failures": 0, "recovery_failures": 0}
 
     @property
     def name(self) -> str:
         return "context-tuner"
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._delegate, name)
 
     def update_model(self, model: str, context_length: int, base_url: str = "", api_key: Any = "", provider: str = "", api_mode: str = "") -> None:
         if hasattr(self._delegate, "update_model"):
@@ -84,37 +98,35 @@ class ContextTunerEngine:
         )
         self._last_plan = plan
 
-        compress = getattr(self._delegate, "compress")
+        compress = self._delegate.compress
         try:
-            result = compress(messages, current_tokens=current_tokens, focus_topic=focus_topic, **kwargs)
-        except TypeError:
-            try:
-                result = compress(messages, current_tokens=current_tokens, focus_topic=focus_topic)
-            except TypeError:
-                result = compress(messages, current_tokens=current_tokens)
-
-        try:
-            self._store.record_event(
-                old_session_id=self._session_id,
-                new_session_id=self._session_id,
-                original_count=len(messages),
-                compressed_count=len(result),
-                total_tokens=plan.total_tokens,
-                decisions=[d.__dict__ for d in plan.decisions],
-            )
+            self._pending_operation = self._store.begin(old_session_id=self._session_id, original_count=len(messages), total_tokens=plan.total_tokens, messages=messages, decisions=[d.__dict__ for d in plan.decisions])
         except Exception:
-            # Audit failure must never break compression.
-            pass
+            self._health["audit_failures"] += 1
+            self._pending_operation = None
+        try:
+            result = _invoke_compatible(compress, [
+                ((messages,), {"current_tokens": current_tokens, "focus_topic": focus_topic, **kwargs}),
+                ((messages,), {"current_tokens": current_tokens, "focus_topic": focus_topic}),
+                ((messages,), {"current_tokens": current_tokens}),
+                ((messages,), {}),
+            ])
+        except TypeError as exc:
+            raise DelegateCompressionError("Hermes compression delegate raised TypeError") from exc
+        self._pending_count = len(result)
         return result
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        if self._pending_operation:
+            try:
+                self._store.finalize(self._pending_operation, new_session_id=session_id or "", compressed_count=self._pending_count)
+            except Exception:
+                self._health["audit_failures"] += 1
+            self._pending_operation = None
         self._session_id = session_id or ""
         fn = getattr(self._delegate, "on_session_start", None)
         if callable(fn):
-            try:
-                fn(session_id, **kwargs)
-            except TypeError:
-                fn(session_id)
+            _invoke_compatible(fn, [((session_id,), kwargs), ((session_id,), {})])
 
     def on_session_end(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         fn = getattr(self._delegate, "on_session_end", None)
@@ -133,6 +145,8 @@ class ContextTunerEngine:
             "engine": self.name,
             "recovery_store": str(default_store_path()),
             "last_plan": self._last_plan.to_dict() if self._last_plan else None,
+            "health": dict(self._health),
+            "pending_compression": bool(self._pending_operation),
         })
         return status
 
