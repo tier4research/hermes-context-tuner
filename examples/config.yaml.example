@@ -1,0 +1,10 @@
+context:
+  engine: context-tuner
+
+# Optional: ensure context-engine tools are available on platforms where you want
+# the agent to call context_tuner_status directly.
+# Toolset configuration varies by Hermes version/profile; in interactive Hermes,
+# use:
+#   /tools
+# or:
+#   hermes tools enable context_engine
