@@ -68,6 +68,15 @@ class ContextTunerEngine:
     def name(self) -> str:
         return "context-tuner"
 
+    def __getattr__(self, name: str) -> Any:
+        """Expose Hermes ContextEngine state fields from the live delegate."""
+        if name.startswith("__"):
+            raise AttributeError(name)
+        try:
+            return getattr(self._delegate, name)
+        except AttributeError as exc:
+            raise AttributeError(f"{type(self).__name__!s} object has no attribute {name!r}") from exc
+
     def update_model(self, model: str, context_length: int, base_url: str = "", api_key: Any = "", provider: str = "", api_mode: str = "") -> None:
         if hasattr(self._delegate, "update_model"):
             self._delegate.update_model(model, context_length, base_url=base_url, api_key=api_key, provider=provider, api_mode=api_mode)

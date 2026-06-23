@@ -34,3 +34,12 @@ def test_audit_failure_does_not_break_compression(monkeypatch):
     engine._delegate=Delegate(); engine._store=BadStore(); engine._last_plan=None; engine._session_id="s"; engine._pending_operation=None; engine._pending_count=0; engine._health={"audit_failures":0,"recovery_failures":0}
     assert engine.compress([{"role":"user","content":"x"}],current_tokens=1)
     assert engine.get_status()["health"]["audit_failures"] == 1
+
+def test_engine_exposes_delegate_context_fields():
+    engine=ContextTunerEngine.__new__(ContextTunerEngine)
+    class Delegate:
+        context_length=131072
+        threshold_tokens=98304
+    engine._delegate=Delegate()
+    assert engine.context_length == 131072
+    assert engine.threshold_tokens == 98304
