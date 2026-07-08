@@ -43,7 +43,14 @@ class ContextTunerEngine:
 
     def __init__(self):
         self._delegate = _make_default_compressor(model=os.environ.get("HERMES_MODEL") or "unknown")
-        self._store = RecoveryPointerStore(default_store_path())
+        # The recovery store is an audit sidecar; if it can't be opened
+        # (e.g. sqlite lock contention with concurrent cron sessions),
+        # the engine must still load rather than silently falling back
+        # to the built-in compressor.
+        try:
+            self._store = RecoveryPointerStore(default_store_path())
+        except Exception:
+            self._store = None
         self._last_plan = None
         self._session_id = ""
 
@@ -94,6 +101,8 @@ class ContextTunerEngine:
                 result = compress(messages, current_tokens=current_tokens)
 
         try:
+            if self._store is None:
+                self._store = RecoveryPointerStore(default_store_path())
             self._store.record_event(
                 old_session_id=self._session_id,
                 new_session_id=self._session_id,
@@ -157,12 +166,19 @@ class ContextTunerEngine:
         if name != "context_tuner_status":
             return json.dumps({"error": f"unknown context tuner tool: {name}"})
         limit = int(args.get("limit", 5) if isinstance(args, dict) else 5)
-        return json.dumps({"status": self.get_status(), "events": self._store.latest_events(limit)}, default=str)
+        try:
+            events = self._store.latest_events(limit) if self._store else []
+        except Exception as exc:
+            events = [{"error": f"recovery store unavailable: {exc}"}]
+        return json.dumps({"status": self.get_status(), "events": events}, default=str)
 
 
 def context_tuner_command(args: str = "", **kwargs: Any) -> str:
-    store = RecoveryPointerStore(default_store_path())
-    events = store.latest_events(10)
+    try:
+        store = RecoveryPointerStore(default_store_path())
+        events = store.latest_events(10)
+    except Exception as exc:
+        return f"Hermes Context Tuner: recovery store unavailable ({exc})."
     if not events:
         return "Hermes Context Tuner is installed. No compression events recorded yet."
     lines = ["Hermes Context Tuner recent compression events:"]

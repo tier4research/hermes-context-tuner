@@ -19,8 +19,14 @@ class RecoveryPointerStore:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(str(self.path))
+        # timeout + busy_timeout + WAL: the gateway and concurrent cron
+        # sessions share this file; the default 5s lock wait caused
+        # "database is locked" during engine init and a silent fallback
+        # to the built-in compressor.
+        con = sqlite3.connect(str(self.path), timeout=30)
         con.row_factory = sqlite3.Row
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("PRAGMA journal_mode=WAL")
         return con
 
     def _init_schema(self) -> None:
