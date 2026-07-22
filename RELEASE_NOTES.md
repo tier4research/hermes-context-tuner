@@ -1,3 +1,21 @@
+# v0.2.0-beta.1
+
+Context compression audit, recovery pointers, and agent-operable context hygiene — stable beta.
+
+## What's new since alpha
+
+- **Sales-forward README.** Rewritten to lead with the problem (invisible compression, no recovery path, blind token pressure) and highlight what makes it different: budget-aware packing plans, compression audit trail, agent-operable commands, and upgrade resilience.
+- **Stability improvements.** Recovery store hardened against SQLite lock contention from concurrent cron sessions. Context engine tool schema aligned with Hermes' `agent_init` contract (no double-wrapped function schemas).
+- **Production data available.** 78 real compression events recorded across daily use, 10,565 recovery pointers — decision distribution: `keep_raw=6789`, `summarize=3592`, `externalize_hint=184`.
+
+## Known limitations
+
+- No CI matrix against multiple Hermes versions yet — currently tested against Hermes main.
+- Externalization hints for large tool outputs are advisory only; actual pruning depends on the Hermes built-in compressor.
+- Recovery pointer store is a sidecar SQLite file, not yet integrated with Hermes' session DB.
+
+---
+
 # v0.1.0-alpha.1
 
 Initial public alpha of Hermes Context Tuner.

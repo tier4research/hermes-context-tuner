@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-context-tuner"
-version = "0.1.0-alpha.1"
-description = "Upgrade-resilient context optimization engine for Hermes Agent."
+version = "0.2.0-beta.1"
+description = "Recoverable context compression: audit trails, budget-aware packing, and agent-operable context hygiene for long AI sessions."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{name = "Tier 4 Research", email = "mjohnson@novacoresystems.com"}]
 keywords = ["hermes-agent", "context", "compression", "ai-agents", "prompt-budget"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
