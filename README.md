@@ -128,7 +128,7 @@ This is explicitly designed not to. Context Tuner introspects the live compresso
 Not currently. The integration is through Hermes' `ContextEngine` interface. A generic `ContextTunerEngine` core is feasible — the audit trail, budget planner, and recovery store are agent-agnostic — but the adapter layer is Hermes-specific today.
 
 ### What's the relationship with Memorant?
-[Memorant](https://github.com/tier4research/memorant) is a separate project for *long-term* agent memory: claims with provenance, trust tiers, and atomic corrections in a single SQLite file. Context Tuner handles *short-term* working context compression. They're designed to complement each other — see the [Memorant suite workflow](https://github.com/tier4research/memorant#suite-workflow).
+[Memorant](https://github.com/tier4research/memorant) is a separate project for *long-term* agent memory: claims with provenance, trust tiers, and atomic corrections in a single SQLite file. Context Tuner handles *short-term* working context compression. [Expectation Ledger](https://github.com/tier4research/expectation-ledger) is a circuit breaker for agent control loops — predict, compare, and self-block on divergence. All three are designed to complement each other — see the [Memorant suite workflow](https://github.com/tier4research/memorant#suite-workflow).
 
 ---
 
