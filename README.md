@@ -110,6 +110,28 @@ print(engine.get_status())
 
 ---
 
+## FAQ
+
+### What is Hermes Context Tuner?
+Hermes Context Tuner is a Python library that wraps an agent's context compressor and records what it did: which messages were kept raw, which were summarized, and which session each compressed segment came from. It provides an audit trail, a token-budget planner, and a status tool the agent can call itself.
+
+### Does Context Tuner replace the built-in compressor?
+No. It delegates compression to the agent's native `ContextCompressor`. What it adds is observability: a budget plan you inspect beforehand, an audit trail afterward, and recovery pointers to the original session logs.
+
+### Can Context Tuner recover compressed messages?
+It provides pointers — session ID and message range — not the raw text. If you need the original messages, you read the session log that Context Tuner points to.
+
+### Does it break when Hermes updates?
+This is explicitly designed not to. Context Tuner introspects the live compressor's constructor at runtime and passes only the kwargs it supports. If a Hermes update changes the interface, the tool fails at import/startup rather than silently corrupting the session.
+
+### Does it work with agents other than Hermes?
+Not currently. The integration is through Hermes' `ContextEngine` interface. A generic `ContextTunerEngine` core is feasible — the audit trail, budget planner, and recovery store are agent-agnostic — but the adapter layer is Hermes-specific today.
+
+### What's the relationship with Memorant?
+[Memorant](https://github.com/tier4research/memorant) is a separate project for *long-term* agent memory: claims with provenance, trust tiers, and atomic corrections in a single SQLite file. Context Tuner handles *short-term* working context compression. They're designed to complement each other — see the [Memorant suite workflow](https://github.com/tier4research/memorant#suite-workflow).
+
+---
+
 ## License
 
 Apache License 2.0.

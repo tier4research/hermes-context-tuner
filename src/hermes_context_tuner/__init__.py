@@ -6,14 +6,18 @@ context audit metadata, and recovery-pointer sidecar records.
 """
 
 from .budget import BudgetPlan, MessageDecision, build_budget_plan, estimate_message_tokens
+from .engine import ContextTunerEngine, context_tuner_command, register
 from .recovery import RecoveryPointerStore
 
-__version__ = "0.1.0-alpha.1"
+__version__ = "0.2.0-beta.1"
 
 __all__ = [
     "BudgetPlan",
+    "ContextTunerEngine",
     "MessageDecision",
     "RecoveryPointerStore",
     "build_budget_plan",
+    "context_tuner_command",
     "estimate_message_tokens",
+    "register",
 ]
