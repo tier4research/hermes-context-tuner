@@ -7,3 +7,8 @@ build/
 dist/
 *.egg-info/
 .pytest_cache/
+
+# Internal planning/report artifacts — not for public release
+plans/
+reports/
+references/internal-*
