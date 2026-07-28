@@ -1,0 +1,60 @@
+name: Leak Check
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan staged-like content for sensitive patterns
+        run: |
+          FAIL=0
+          # Patterns — keep in sync with scripts/leak_scan.py
+          HIGH_PATTERNS=(
+            'C:\\\\Users\\\\Admin'
+            '/c/Users/Admin'
+            '/home/[a-z][a-z0-9_-]*/'
+            '\bElle\b(?=.*\.(py|md|txt|json|yaml|yml|toml|cfg|ini))'
+            '93\.188\.161\.20'
+            '~\.mempalace-sqlite-vec'
+          )
+          for pattern in "${HIGH_PATTERNS[@]}"; do
+            MATCHES=$(grep -rn "$pattern" --include='*.py' --include='*.md' --include='*.txt' --include='*.json' --include='*.yaml' --include='*.yml' --include='*.toml' --include='*.cfg' --include='*.ini' . 2>/dev/null \
+              | grep -v node_modules \
+              | grep -v '.git/' \
+              || true)
+            if [ -n "$MATCHES" ]; then
+              echo "🔴 LEAK: pattern '$pattern' matched:"
+              echo "$MATCHES"
+              FAIL=1
+            fi
+          done
+          
+          # Check for sensitive filenames
+          BAD_FILES=$(find . -name '.env' -not -path './.git/*' -not -path '*/node_modules/*' 2>/dev/null || true)
+          if [ -n "$BAD_FILES" ]; then
+            echo "🔴 LEAK: .env file tracked in repo:"
+            echo "$BAD_FILES"
+            FAIL=1
+          fi
+          
+          BAD_FILES=$(find . -name '*.pem' -not -path './.git/*' -not -path '*/node_modules/*' 2>/dev/null || true)
+          if [ -n "$BAD_FILES" ]; then
+            echo "🔴 LEAK: Private key (.pem) file tracked in repo:"
+            echo "$BAD_FILES"
+            FAIL=1
+          fi
+          
+          if [ $FAIL -eq 1 ]; then
+            echo ""
+            echo "❌ LEAK DETECTED — commit/push blocked."
+            echo "   Run the local pre-commit hook (scripts/leak_scan.py --staged) to catch this earlier."
+            exit 1
+          else
+            echo "✅ No sensitive content leaks detected."
+          fi
