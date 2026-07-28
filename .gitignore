@@ -12,3 +12,11 @@ dist/
 plans/
 reports/
 references/internal-*
+references/patch*
+references/remediation*
+
+# Private infra files
+scripts/archive/
+scripts/patch_*
+*.report.md
+AUDIT_*.md
