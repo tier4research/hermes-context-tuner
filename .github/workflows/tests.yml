@@ -3,6 +3,12 @@ name: tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      hermes_agent_ref:
+        description: hermes-agent git ref for the host-contract job
+        required: false
+        default: main
 
 jobs:
   test:
@@ -10,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.10', '3.11', '3.12']
+        python-version: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,3 +26,35 @@ jobs:
       - run: python -m pip install -e .
       - run: PYTHONPATH=src python -m pytest tests -q -o 'addopts='
       - run: python -m build
+
+  # The host contract lives in a separate, external repository. This job is
+  # informational (continue-on-error): it pins that the host assumptions this
+  # wrapper relies on still hold, but an unrelated change in hermes-agent must
+  # not block a release of this package. Override the ref with the
+  # HERMES_AGENT_REF repository variable or the workflow_dispatch input.
+  host-contract:
+    name: hermes-agent host contract (external, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install this package
+        run: |
+          python -m pip install --upgrade pip pytest
+          python -m pip install -e .
+      - name: Clone hermes-agent
+        env:
+          HERMES_AGENT_REF: ${{ github.event.inputs.hermes_agent_ref || vars.HERMES_AGENT_REF || 'main' }}
+        run: |
+          git clone --depth 1 --branch "$HERMES_AGENT_REF" \
+            https://github.com/NousResearch/hermes-agent.git .hermes-agent
+      - name: Install hermes-agent
+        run: python -m pip install -e ./.hermes-agent
+      - name: Install the context-engine shim into the checkout
+        run: hermes-context-tuner install-hermes --hermes-repo ./.hermes-agent
+      - name: Run the host-contract tests
+        working-directory: .hermes-agent
+        run: python -m pytest tests/agent/test_context_engine.py tests/agent/test_context_engine_host_contract.py -q -o addopts=

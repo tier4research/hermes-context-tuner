@@ -9,7 +9,7 @@ from .budget import BudgetPlan, MessageDecision, build_budget_plan, estimate_mes
 from .engine import ContextTunerEngine, context_tuner_command, register
 from .recovery import RecoveryPointerStore
 
-__version__ = "0.2.0-beta.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "BudgetPlan",

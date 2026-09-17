@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+# Status glyphs break on legacy Windows consoles (cp1252). Force UTF-8 for the
+# scanner subprocess so a clean scan can never fail on output encoding.
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+
 SCAN_SCRIPT="${LEAK_SCAN_PATH:-}"
 
 # Try to find leak_scan.py

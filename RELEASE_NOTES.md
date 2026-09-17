@@ -1,4 +1,4 @@
-# Unreleased (v0.3.0 draft)
+# v0.3.0
 
 Context continuity journal: compression lineage you can trust, plus explicit
 project checkpoints that survive compression and session refreshes.

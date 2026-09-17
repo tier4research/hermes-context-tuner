@@ -106,7 +106,7 @@ print(engine.get_status())
 
 ## Status
 
-**Beta** (v0.2.0-beta.1). Budget planning, the audit trail, status commands, and the Hermes integration are working and tested. Recovery is currently pointer-level only. Tested against Hermes v0.4.x — a CI matrix across versions is planned, so compatibility with other releases is unverified. 7 commits, 0 external stars.
+**Beta** (v0.3.0). Budget planning, the audit trail, status commands, and the Hermes integration are working and tested. Recovery is currently pointer-level only. Tested against Hermes v0.4.x — a CI matrix across versions is planned, so compatibility with other releases is unverified. 7 commits, 0 external stars.
 
 ---
 
