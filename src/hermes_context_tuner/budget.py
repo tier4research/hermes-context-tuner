@@ -1,10 +1,72 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any, Iterable
 
 _CHARS_PER_TOKEN = 4
+
+
+@dataclass(frozen=True)
+class BudgetPolicy:
+    """Configurable rolling-context allocation (Task 13).
+
+    Evidence-gated: production defaults are NOT changed by this class's
+    existence — it only becomes authoritative when a config explicitly
+    supplies it. The checkpoint_needed signal requests a *planned* refresh;
+    it never schedules or forces a session reset.
+    """
+
+    context_budget: int
+    recent_conversation: int
+    source_material: int
+    relevant_retrieval: int
+    project_state: int
+    current_work: int
+    output_reserve: int
+
+    @dataclass(frozen=True)
+    class Derived:
+        tail_budget: int
+        total: int
+
+    @property
+    def derived(self) -> "BudgetPolicy.Derived":
+        total = (
+            self.recent_conversation
+            + self.source_material
+            + self.relevant_retrieval
+            + self.project_state
+            + self.current_work
+            + self.output_reserve
+        )
+        return BudgetPolicy.Derived(tail_budget=self.recent_conversation, total=total)
+
+    def __post_init__(self) -> None:
+        if self.derived.total > self.context_budget:
+            raise ValueError(
+                f"budget allocation ({self.derived.total}) exceeds context_budget"
+                f" ({self.context_budget})"
+            )
+        for name in (
+            "context_budget", "recent_conversation", "source_material",
+            "relevant_retrieval", "project_state", "current_work", "output_reserve",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"budget field '{name}' must be non-negative")
+
+    def checkpoint_needed(
+        self, *, current_tokens: int, compressions_since_checkpoint: int
+    ) -> bool:
+        """Bounded signal that a planned refresh/checkpoint is advisable.
+
+        Fires on either: riding past the planned working set, or repeated
+        compressions without an explicit checkpoint (lossy-summary risk).
+        """
+        working_set = self.derived.total - self.output_reserve
+        if current_tokens > int(0.9 * working_set):
+            return True
+        return compressions_since_checkpoint >= 3
 
 
 @dataclass(frozen=True)
