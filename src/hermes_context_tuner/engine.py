@@ -160,14 +160,28 @@ class ContextTunerEngine:
         self._reconcile_stale_operations()
 
     def _audit_failure(self) -> None:
-        """Count a wrapper-side audit failure without ever raising.
+        """Count a wrapper-side audit failure without raising.
 
         Error accounting is wrapper-owned bookkeeping: if it can raise, a
         bookkeeping fault escalates into the host-visible failure this wrapper
         exists to prevent (audit HIGH-3).
+
+        Wrapper-local state is read with ``object.__getattribute__`` because
+        ``__getattr__`` forwards unknown reads to the delegate: an unbound
+        ``_health`` meant the counter mutated *delegate-owned* state instead of
+        being a local no-op (audit MEDIUM delegate-mutation).
+
+        The guarantee is non-throwing for ordinary ``Exception``s under the
+        stock class. It does not claim to survive a shadowed helper method or a
+        ``BaseException``, which no wrapper-local counter should try to catch.
         """
         try:
-            health = self._health
+            health = object.__getattribute__(self, "_health")
+        except Exception:
+            return
+        try:
+            if not isinstance(health, dict):
+                return
             health["audit_failures"] = int(health.get("audit_failures", 0) or 0) + 1
         except Exception:
             pass
@@ -181,17 +195,38 @@ class ContextTunerEngine:
         (audit HIGH-2, HIGH-13). "Interrupted" is the honest state, since the
         compression itself succeeded but its completion could not be recorded.
         """
-        if not operation_id or self._store is None:
-            return
         try:
-            self._store.mark_interrupted_if_started(operation_id, reason=reason[:200])
-            return
+            if not operation_id:
+                return
+            store = object.__getattribute__(self, "_store")
+            if store is None:
+                return
+            store.mark_interrupted_if_started(operation_id, reason=reason[:200])
         except Exception:
-            pass
+            # Never raise, and never assert a terminal state we cannot justify:
+            # calling a successful compression 'failed' is provenance
+            # corruption in the other direction, and after an uncertain write a
+            # second terminal transition could land on a row that is already
+            # terminal (audit HIGH-14).
+            self._audit_failure()
+
+    def _clear_pending_state(self) -> None:
+        """Drop every pending pointer without an interception point.
+
+        ``__setattr__`` can be subclassed or instrumented, and publication is
+        incremental: a failure part-way through left a live pointer at a row
+        that had just been terminalized, so a later boundary could still act on
+        it (audit HIGH-16). Cleanup therefore uses ``object.__setattr__``.
+        Never raises.
+        """
         try:
-            self._store.fail_compression(operation_id, reason=reason[:200])
+            object.__setattr__(self, "_pending_operation", None)
+            object.__setattr__(self, "_pending_count", 0)
+            object.__setattr__(self, "_pending_result_fingerprint", None)
+            object.__setattr__(self, "_pending_checkpoint_hint", False)
+            object.__setattr__(self, "_pending_old_session_id", None)
         except Exception:
-            pass
+            self._audit_failure()
 
     def _reconcile_stale_operations(self) -> None:
         """Close operations left in 'started' by a previous process death."""
@@ -342,17 +377,23 @@ class ContextTunerEngine:
         # ---- phase 1: open a 'started' journal operation (fail-open) ----
         pending_op: str | None = None
         lossy = False
-        trigger: dict[str, Any] = {}
-        # Plan inspection and trigger construction are wrapper work too: a
-        # malformed or extended plan object, or a non-string focus_topic, must
-        # degrade to "no plan" rather than deny the compression (audit
-        # HIGH-4b/4c). With no plan there is nothing truthful to journal, so
-        # the row is skipped entirely.
+        # Plan inspection and trigger construction are wrapper work too, but
+        # they are *separate* optional boundaries. Failing to build trigger
+        # metadata must not discard an already-valid plan: the journal row is
+        # how a compression stays recoverable, and skipping it silently loses
+        # the snapshot, the decisions and the provenance -- a hostile
+        # focus_topic/force object is not consent to skip journaling
+        # (audit HIGH-15, HIGH-4b/4c).
         try:
             lossy = bool(plan is not None and any(
                 d.decision in ("summarize", "externalize_hint")
                 for d in plan.decisions
             ))
+        except Exception:
+            self._audit_failure()
+            lossy = False
+        trigger: dict[str, Any] = {"metadata_degraded": True}
+        try:
             trigger = {
                 "force": bool(kwargs.get("force", False)),
                 # Presence and length only: focus_topic is free text and must
@@ -363,9 +404,6 @@ class ContextTunerEngine:
             }
         except Exception:
             self._audit_failure()
-            plan = None
-            lossy = False
-            trigger = {}
         try:
             if self._store is None:
                 self._store = RecoveryPointerStore(default_store_path())
@@ -467,11 +505,10 @@ class ContextTunerEngine:
                 self._terminalize_operation(
                     pending_op, "post-delegate bookkeeping failed"
                 )
-                self._pending_operation = None
-                self._pending_result_fingerprint = None
-                self._pending_checkpoint_hint = False
-            except Exception:
-                pass
+            finally:
+                # Unconditional: a raising terminalize must not leave the
+                # pointer live at a row that is now terminal (audit HIGH-16).
+                self._clear_pending_state()
             return result
         try:
             self._pending_operation = pending_op
@@ -488,8 +525,11 @@ class ContextTunerEngine:
                 self._terminalize_operation(
                     pending_op, "pending-state publication failed"
                 )
-            except Exception:
-                pass
+            finally:
+                # Partial publication is fully retracted, not just
+                # terminalized: a live pointer lets a later boundary finalize
+                # a row that is already terminal (audit HIGH-16).
+                self._clear_pending_state()
         return result
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:

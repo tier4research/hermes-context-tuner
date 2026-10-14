@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-context-tuner"
-version = "0.3.2"
+version = "0.3.3"
 description = "Audit trail and token-budget planning for LLM context compression. See what your agent summarized away and where to find it."
 readme = "README.md"
 requires-python = ">=3.10"

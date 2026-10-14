@@ -1,3 +1,58 @@
+# v0.3.3
+
+Verification honesty, second pass. Compression behaviour is unchanged again;
+what changed is that the installer's *proof* is now loadability rather than
+file placement, and that recovery bookkeeping can no longer damage state it
+does not own.
+
+## Fixed
+
+- **The installer now loads the engine instead of locating it.** 0.3.2's probe
+  asked the loader to resolve a directory and called that verified, so a shim
+  that was empty or raised on import still verified as installed. The probe now
+  exercises the host's own activation path (`load_context_engine`) and requires
+  a real engine object back; the bundled-shadow check, discovery check and
+  framed-result check all report which one failed.
+- **A tree with no Hermes runtime is "not verified", not a failed install.**
+  Copying the shim is the whole operation when Hermes is not there yet; the old
+  fail-closed exit code turned an ordinary pre-Hermes install into an error.
+  The exit code stays strict for the live Hermes home and advisory for an
+  explicit `--hermes-repo` build target -- so the CI job that checks the host
+  contract is not failed by the host it is checking.
+- **A failed `--set-config` is now fatal instead of silent.** `hermes config
+  set` ran with `check=False` inside the copy step and could fail with the
+  installer still printing success: the engine was activated in name only.
+- **Post-success recovery no longer records a delivered compression as
+  failed.** Terminalizing a phase-1 row uses `mark_interrupted_if_started`,
+  never `fail_compression`: "the work happened, its completion record did not"
+  is `interrupted`, and calling it failed is provenance corruption in the
+  other direction.
+- **Error accounting can no longer mutate the delegate.** `_audit_failure`
+  reads its own health dict with `object.__getattribute__`, because an unbound
+  `_health` would otherwise be forwarded to the delegate by `__getattr__` and
+  have the host's own dictionary incremented.
+- **Recovery cleanup runs in a `finally`.** A raising terminalize can no
+  longer leave a live pending pointer aimed at a row that is already terminal.
+- **A hostile `focus_topic` no longer costs the compression its journal row.**
+  Plan inspection and trigger-metadata construction are inside their own
+  guarded boundaries, so a malformed argument degrades the *metadata* (marked
+  `metadata_degraded`) instead of discarding an already-valid plan or skipping
+  journaling.
+
+## Tests
+
+142 passing (was 131). The 16 new/extended installer- and terminal-state tests
+were RED-proven against `821d5f1`: 12 fail there, including an empty shim, an
+import-raising shim, an engine missing from discovery, a silent probe, a
+pre-Hermes tree, a shadowed checkout, and the delegate-mutation case.
+
+## Known open items
+
+- F11 (open): boundary correlation is permissive when session ids are absent,
+  and the concurrency claim there is asserted rather than tested.
+- Verification is point-in-time: it imports the module tree now; a later
+  Hermes upgrade can invalidate it. Re-run `install-hermes` after upgrades.
+
 # v0.3.2
 
 Installer verification and journal-row honesty. Compression behaviour is

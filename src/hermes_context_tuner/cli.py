@@ -53,24 +53,57 @@ def bundled_engine_dir(hermes_repo: str | Path | None = None) -> Path:
     return Path(root) / "plugins" / "context_engine" / "context-tuner"
 
 
-_LOADER_PROBE = (
-    "import importlib.util as _iu, json, sys\n"
-    "_ha = sys.argv[1]\n"
-    "_spec = _iu.spec_from_file_location('_ct_ctx_engine', _ha + '/plugins/context_engine/__init__.py')\n"
-    "_m = _iu.module_from_spec(_spec)\n"
-    "_spec.loader.exec_module(_m)\n"
-    "_out = {'resolved': None, 'discover': []}\n"
-    "try:\n"
-    "    _r = _m.find_engine_dir('context-tuner')\n"
-    "    _out['resolved'] = str(_r) if _r is not None else None\n"
-    "except Exception as _e:\n"
-    "    _out['find_error'] = type(_e).__name__\n"
-    "try:\n"
-    "    _out['discover'] = [repr(_d) for _d in _m.discover_context_engines()]\n"
-    "except Exception as _e:\n"
-    "    _out['discover_error'] = type(_e).__name__\n"
-    "print(json.dumps(_out))\n"
-)
+_LOADER_PROBE = r"""
+import importlib.util as _iu
+import json, os, sys
+
+_ha = os.path.abspath(sys.argv[1])
+if _ha not in sys.path:
+    sys.path.insert(0, _ha)
+out = {"marker": "__CT_PROBE__", "resolved": None, "discover": None, "load": None}
+_mod = None
+
+
+def _err(key, exc):
+    out[key] = type(exc).__name__ + ": " + str(exc)[:200]
+
+
+try:
+    _spec = _iu.spec_from_file_location(
+        "_ct_ctx_engine", os.path.join(_ha, "plugins", "context_engine", "__init__.py")
+    )
+    _mod = _iu.module_from_spec(_spec)
+    sys.modules["_ct_ctx_engine"] = _mod
+    _spec.loader.exec_module(_mod)
+    out["loader_imported"] = True
+except Exception as e:
+    out["loader_imported"] = False
+    _err("import_error", e)
+
+if _mod is not None:
+    try:
+        _r = _mod.find_engine_dir("context-tuner")
+        out["resolved"] = os.path.abspath(str(_r)) if _r is not None else None
+    except Exception as e:
+        _err("find_error", e)
+    try:
+        out["discover"] = [str(_d) for _d in _mod.discover_context_engines()]
+    except Exception as e:
+        _err("discover_error", e)
+    # Resolving a directory is not loading an engine. Exercise the host's own
+    # activation path, so an unloadable shim cannot verify as installed.
+    try:
+        _load = getattr(_mod, "load_context_engine", None)
+        if callable(_load):
+            _engine = _load("context-tuner")
+            out["load"] = type(_engine).__name__ if _engine is not None else "None"
+        else:
+            out["load_unavailable"] = "host exposes no load_context_engine()"
+    except Exception as e:
+        _err("load_error", e)
+
+print("__CT_PROBE__" + json.dumps(out))
+"""
 
 
 def verify_install(
@@ -78,49 +111,79 @@ def verify_install(
     hermes_repo: str | Path | None = None,
     strict: bool | None = None,
 ) -> dict:
-    """Verify that the *loader* resolves the shim that was just installed.
+    """Verify that Hermes can *load* the shim, not merely that it exists.
 
     Copying files is not installing. Hermes resolves engines bundled-first, so
     a stale, partial or empty bundled directory silently shadows the user
     install while the CLI still prints success -- the September outage exactly
-    (audit CRITICAL-1: a false-success deployment path).
+    (audit CRITICAL-1). Locating the directory is not loading the engine
+    either: the second CRITICAL was that this function called a resolved path
+    "verified" without ever exercising the host's activation path
+    (``load_context_engine``), so a shim that raises on import or registers no
+    engine verified as installed.
 
     ``strict`` defaults to True only when installing into the live Hermes home,
     where the plugin must load. For an explicit checkout (``--hermes-repo``,
     i.e. a build/CI target) the probe's findings are reported as notes instead:
     the tree under test is the caller's choice, and failing a build because the
-    loader cannot be probed there would break the very job that checks the
-    host contract. An unprovable install in the live home is still a failure.
+    loader cannot be probed there would break the very job that checks the host
+    contract. An unprovable install in the live home is still a failure.
+
+    Distinct outcomes, deliberately:
+      * bundled shadow, divergent resolution, unloadable engine -> failure;
+      * no Hermes runtime at all in the tree -> unverified, not failed: the
+        copy is the whole of the requested operation (audit HIGH: a pre-Hermes
+        or pre-venv install must not become a fatal installer result).
+
+    The probe runs the root's own venv interpreter with this process's
+    environment, so it is the closest available equivalent of a real Hermes
+    start-up; it is still a point-in-time result and a later upgrade can
+    invalidate it.
     """
     if strict is None:
         strict = hermes_repo is None
     target = Path(target).resolve()
+    root = Path(hermes_repo) if hermes_repo else _repo_root_from_hermes()
     report: dict = {
         "ok": False,
         "strict": strict,
         "target": str(target),
         "resolved": None,
         "shadow": None,
+        "load": None,
         "reasons": [],
         "notes": [],
     }
     findings = report["reasons"] if strict else report["notes"]
 
-    bundled = bundled_engine_dir(hermes_repo)
-    shadow_exists = False
+    # A bundled directory wins over the user dir merely by existing, so it is
+    # checked first -- and an *uninspectable* one is not reported as clean.
+    bundled: Path | None = None
     try:
-        shadow_exists = bundled.is_dir()
-    except Exception:
-        shadow_exists = False
-    if shadow_exists and bundled.resolve() != target:
+        candidate = bundled_engine_dir(hermes_repo).resolve()
+        bundled = candidate if candidate.is_dir() else None
+    except Exception as exc:
+        report["reasons"].append(
+            f"could not inspect the bundled engine dir: {type(exc).__name__}: {exc}"
+        )
+    if bundled is not None and bundled != target:
         report["shadow"] = str(bundled)
         report["reasons"].append(
             f"bundled shadow at {bundled} -- Hermes resolves it first, so "
             f"{target} will not load"
         )
 
-    root = Path(hermes_repo) if hermes_repo else _repo_root_from_hermes()
-    python = Path(root) / "venv" / "Scripts" / "python.exe"
+    loader_py = root / "plugins" / "context_engine" / "__init__.py"
+    if not loader_py.is_file():
+        report["notes"].append(
+            f"not verified: no Hermes context_engine loader at {loader_py}"
+        )
+        report["ok"] = not report["reasons"]
+        return report
+
+    python = root / "venv" / "Scripts" / "python.exe"
+    if not python.is_file():
+        python = root / "venv" / "bin" / "python"
     if not python.is_file():
         python = Path(sys.executable)
     try:
@@ -128,21 +191,69 @@ def verify_install(
             [str(python), "-c", _LOADER_PROBE, str(root)],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=120,
             check=False,
+            cwd=str(root),
+            env={**os.environ, "HERMES_HOME": str(_hermes_home())},
         )
-        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
-        data = json.loads(lines[-1]) if lines else {}
-        resolved = data.get("resolved")
-        report["resolved"] = resolved
-        report["discover"] = data.get("discover")
-        if not resolved:
+        if proc.returncode != 0:
+            tail = ((proc.stderr or "").strip().splitlines() or [""])[-1][:200]
             findings.append(
-                "loader reported no engine path "
-                f"(find_engine_dir -> None; {data.get('find_error') or 'no error reported'})"
+                f"the loader probe itself failed (rc={proc.returncode}): {tail}"
             )
-        elif Path(resolved).resolve() != target:
-            findings.append(f"loader resolves {resolved}, not the installed target")
+        else:
+            framed = [
+                ln for ln in (proc.stdout or "").splitlines()
+                if ln.startswith("__CT_PROBE__")
+            ]
+            if not framed:
+                findings.append("the loader probe produced no framed result line")
+            else:
+                data = json.loads(framed[-1][len("__CT_PROBE__"):])
+                resolved = data.get("resolved")
+                report["resolved"] = resolved
+                report["discover"] = data.get("discover")
+                report["load"] = data.get("load")
+                if data.get("import_error"):
+                    findings.append(
+                        f"the context_engine loader cannot be imported: {data['import_error']}"
+                    )
+                if data.get("find_error"):
+                    findings.append(f"find_engine_dir() raised: {data['find_error']}")
+                if not resolved:
+                    findings.append(
+                        "loader reported no engine path (find_engine_dir -> None)"
+                    )
+                else:
+                    try:
+                        if Path(resolved).resolve() != target:
+                            findings.append(
+                                f"loader resolves {resolved}, not the installed target {target}"
+                            )
+                    except Exception as exc:
+                        findings.append(
+                            f"could not compare resolved path {resolved!r}: {type(exc).__name__}"
+                        )
+                if data.get("discover_error"):
+                    findings.append(
+                        f"discover_context_engines() raised: {data['discover_error']}"
+                    )
+                elif not any(
+                    "context-tuner" in str(entry)
+                    for entry in (data.get("discover") or [])
+                ):
+                    findings.append(
+                        "the engine is not listed by discover_context_engines()"
+                    )
+                # Loadability: the check whose absence made CRITICAL-1 reachable.
+                if data.get("load_error"):
+                    findings.append(f"the engine failed to load: {data['load_error']}")
+                elif data.get("load_unavailable"):
+                    findings.append(
+                        f"engine load was not exercised: {data['load_unavailable']}"
+                    )
+                elif not data.get("load") or data.get("load") == "None":
+                    findings.append("load_context_engine() returned no engine")
     except Exception as exc:
         findings.append(f"could not probe the loader: {type(exc).__name__}: {exc}")
 
@@ -150,12 +261,16 @@ def verify_install(
     return report
 
 
-def install_engine(hermes_repo: str | None = None, set_config: bool = False) -> Path:
+def install_engine(hermes_repo: str | None = None) -> Path:
     """Install or update the context-engine shim.
 
     Defaults to the user-plugin dir (upgrade-resilient). Pass ``hermes_repo``
     to install into a Hermes checkout's bundled tree instead -- note that a
     bundled copy takes precedence over the user dir at load time.
+
+    Copy only: activation (``apply_config``) and verification
+    (``verify_install``) are separate steps with their own outcomes, so a
+    config failure can no longer be swallowed by a successful copy.
     """
     if hermes_repo:
         target = Path(hermes_repo) / "plugins" / "context_engine" / "context-tuner"
@@ -166,10 +281,30 @@ def install_engine(hermes_repo: str | None = None, set_config: bool = False) -> 
     source = Path(__file__).resolve().parent / "hermes_engine"
     for name in ENGINE_FILES:
         shutil.copy2(source / name, target / name)
-
-    if set_config:
-        subprocess.run(["hermes", "config", "set", "context.engine", "context-tuner"], check=False)
     return target
+
+
+def apply_config() -> tuple[int, str]:
+    """Point Hermes at this engine, reporting the outcome rather than assuming it.
+
+    The previous code ran ``hermes config set`` from inside ``install_engine()``
+    with ``check=False`` and then let the caller print a verified install: if
+    hermes was missing from PATH, the config was locked, or the key was
+    rejected, the engine was activated in name only (audit HIGH: swallowed
+    set-config failure).
+    """
+    try:
+        proc = subprocess.run(
+            ["hermes", "config", "set", "context.engine", "context-tuner"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:
+        return 127, f"{type(exc).__name__}: {exc}"
+    detail = ((proc.stderr or "").strip() or (proc.stdout or "").strip()).splitlines()
+    return proc.returncode, (detail[-1][:200] if detail else "")
 
 
 def _ledger_path() -> Path:
@@ -251,16 +386,30 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.cmd == "install-hermes":
-        target = install_engine(args.hermes_repo, set_config=args.set_config)
+        target = install_engine(args.hermes_repo)
         report = verify_install(target, args.hermes_repo)
+        if args.set_config:
+            rc, detail = apply_config()
+            if rc != 0:
+                suffix = f": {detail}" if detail else ""
+                message = (
+                    "`hermes config set context.engine context-tuner` failed "
+                    f"(rc={rc}){suffix}"
+                )
+                bucket = report["reasons"] if report["strict"] else report["notes"]
+                bucket.append(message)
+                report["ok"] = not report["reasons"]
         if report["ok"]:
-            if report["resolved"]:
+            if report["load"]:
                 print(f"installed context-tuner engine shim to {target}")
-                print(f"verified: the loader resolves {report['resolved']}")
+                print(
+                    f"verified: the loader resolves {report['resolved']} and "
+                    f"load_context_engine() returned a {report['load']}"
+                )
             else:
-                # An explicit --hermes-repo install into a tree with no engine
-                # bundle: nothing to resolve, so do not claim verification.
-                print(f"installed context-tuner engine shim to {target} (not probed)")
+                # Nothing to load in this tree (no Hermes runtime): the copy is
+                # the whole of the operation, so do not claim verification.
+                print(f"installed context-tuner engine shim to {target} (not verified)")
             for note in report["notes"]:
                 print(f"  note: {note}")
             return 0
