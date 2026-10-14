@@ -106,3 +106,57 @@ def test_engine_passes_through_host_read_state_fields():
     engine._delegate = delegate
     assert engine.context_length == 131_072
     assert engine.name == "context-tuner"
+
+
+def test_host_state_writes_land_on_the_delegate_not_the_wrapper():
+    engine = ContextTunerEngine.__new__(ContextTunerEngine)
+    delegate = FakeDelegate()
+    engine._delegate = delegate
+    engine.model_thresholds = {"grok": 0.5}
+    engine._last_compress_refused_would_grow = True
+    engine._compression_telemetry_seed = {"n": 1}
+    assert delegate.model_thresholds == {"grok": 0.5}
+    assert delegate._last_compress_refused_would_grow is True
+    assert delegate._compression_telemetry_seed == {"n": 1}
+    assert "model_thresholds" not in engine.__dict__
+    assert "_compression_telemetry_seed" not in engine.__dict__
+    assert engine.model_thresholds == {"grok": 0.5}
+
+
+def test_update_model_forwards_max_tokens_without_retrying_the_body():
+    class Delegate:
+        def __init__(self):
+            self.calls = []
+
+        def update_model(self, model, context_length, base_url="", api_key="", provider="", api_mode="", max_tokens=None):
+            self.calls.append(max_tokens)
+            if max_tokens == 0:
+                raise TypeError("body error must not be retried")
+
+    engine = ContextTunerEngine.__new__(ContextTunerEngine)
+    delegate = Delegate()
+    engine._delegate = delegate
+    engine.update_model("m", 1000, max_tokens=4096)
+    assert delegate.calls == [4096]
+    try:
+        engine.update_model("m", 1000, max_tokens=0)
+    except TypeError as exc:
+        assert "body error" in str(exc)
+    else:
+        raise AssertionError("body TypeError was swallowed")
+    assert delegate.calls == [4096, 0]
+
+
+def test_update_model_omits_max_tokens_when_the_delegate_lacks_it():
+    class Narrow:
+        def __init__(self):
+            self.calls = []
+
+        def update_model(self, model, context_length, base_url="", api_key="", provider="", api_mode=""):
+            self.calls.append((model, context_length))
+
+    engine = ContextTunerEngine.__new__(ContextTunerEngine)
+    delegate = Narrow()
+    engine._delegate = delegate
+    engine.update_model("m", 2048, max_tokens=1024)
+    assert delegate.calls == [("m", 2048)]

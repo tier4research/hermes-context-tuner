@@ -16,6 +16,26 @@ STALE_OPERATION_SECONDS = 3_600.0
 COMPRESSIONS_BEFORE_CHECKPOINT = 3
 MAX_RESUME_KEY_CHARS = 200
 
+# Instance state the wrapper owns. Everything else the host writes onto the
+# engine (threshold, probes, telemetry seeds) belongs to the live compressor.
+# Landing those writes here is shadow state: reads via __getattr__ still see
+# the delegate's old value.
+_WRAPPER_LOCAL = frozenset({
+    "_delegate",
+    "_store",
+    "_ledger",
+    "_last_plan",
+    "_session_id",
+    "_pending_operation",
+    "_pending_result_fingerprint",
+    "_pending_count",
+    "_pending_checkpoint_hint",
+    "_pending_old_session_id",
+    "_budget_policy",
+    "_compressions_since_checkpoint",
+    "_health",
+})
+
 
 class DelegateCompressionError(RuntimeError):
     """Hermes' compressor raised while executing a valid contract call."""
@@ -187,9 +207,47 @@ class ContextTunerEngine:
                 f"{type(self).__name__!s} object has no attribute {name!r}"
             ) from exc
 
-    def update_model(self, model: str, context_length: int, base_url: str = "", api_key: Any = "", provider: str = "", api_mode: str = "") -> None:
-        if hasattr(self._delegate, "update_model"):
-            self._delegate.update_model(model, context_length, base_url=base_url, api_key=api_key, provider=provider, api_mode=api_mode)
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep wrapper bookkeeping local; forward host mutations to the delegate.
+
+        A write of a name this class defines (``compress``, ``update_model``)
+        is an override and must shadow the class method. Every other write,
+        once the delegate exists, is the host mutating compressor state.
+        """
+        if name in _WRAPPER_LOCAL or not hasattr(self, "_delegate"):
+            object.__setattr__(self, name, value)
+            return
+        if name in type(self).__dict__:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._delegate, name, value)
+
+    def update_model(
+        self,
+        model: str,
+        context_length: int,
+        base_url: str = "",
+        api_key: Any = "",
+        provider: str = "",
+        api_mode: str = "",
+        max_tokens: int | None = None,
+    ) -> None:
+        fn = getattr(self._delegate, "update_model", None)
+        if not callable(fn):
+            return
+        rich = {
+            "model": model,
+            "context_length": context_length,
+            "base_url": base_url,
+            "api_key": api_key,
+            "provider": provider,
+            "api_mode": api_mode,
+            "max_tokens": max_tokens,
+        }
+        narrow = {k: v for k, v in rich.items() if k != "max_tokens"}
+        # Bind against the frozen signature first. Do not catch a TypeError
+        # from the body and retry — that can run a stateful update twice.
+        _invoke_compatible(fn, [((), rich), ((), narrow)])
 
     def update_from_response(self, usage: dict[str, Any]) -> None:
         return self._delegate.update_from_response(usage)
@@ -206,31 +264,49 @@ class ContextTunerEngine:
         return bool(fn(messages)) if callable(fn) else True
 
     def compress(self, messages: list[dict[str, Any]], current_tokens: int = None, focus_topic: str = None, **kwargs: Any) -> list[dict[str, Any]]:
-        context_budget = int(getattr(self._delegate, "threshold_tokens", 0) or current_tokens or 0 or 128_000)
-        tail_budget = int(getattr(self._delegate, "tail_token_budget", 0) or max(8_000, context_budget // 5))
-        protected_head = int(getattr(self._delegate, "protect_first_n", 3) or 3)
-        plan = build_budget_plan(
-            messages,
-            context_budget=context_budget,
-            tail_budget=tail_budget,
-            protected_head=protected_head,
-        )
-        self._last_plan = plan
+        # ---- phase 0: budget planning (fail-open) ----
+        # Planning is wrapper-side work. If it fails, the host must still get
+        # the compression it would have gotten without this wrapper: degrade to
+        # a passthrough with no plan instead of denying the operation.
+        plan = None
+        context_budget = int(current_tokens or 128_000)
+        tail_budget = max(8_000, context_budget // 5)
+        protected_head = 3
+        try:
+            context_budget = int(getattr(self._delegate, "threshold_tokens", 0) or current_tokens or 0 or 128_000)
+            tail_budget = int(getattr(self._delegate, "tail_token_budget", 0) or max(8_000, context_budget // 5))
+            protected_head = int(getattr(self._delegate, "protect_first_n", 3) or 3)
+            plan = build_budget_plan(
+                messages,
+                context_budget=context_budget,
+                tail_budget=tail_budget,
+                protected_head=protected_head,
+            )
+            self._last_plan = plan
+        except Exception:
+            # No plan -> no audit journal for this compression, never no
+            # compression. Reuses audit_failures to keep the health schema stable.
+            self._health["audit_failures"] += 1
+            plan = None
 
         # A previous operation still pending means its boundary callback never
         # arrived (or was lost): it can never finalize and must not be
         # orphaned silently. Record it as interrupted, never as committed.
         if self._pending_operation:
-            self._close_pending_on_teardown(
-                "new compress() began before previous operation's boundary callback"
-            )
+            try:
+                self._close_pending_on_teardown(
+                    "new compress() began before previous operation's boundary callback"
+                )
+            except Exception:
+                self._health["audit_failures"] += 1
+                self._pending_operation = None
 
         # ---- phase 1: open a 'started' journal operation (fail-open) ----
         pending_op: str | None = None
-        lossy = any(
+        lossy = bool(plan is not None and any(
             d.decision in ("summarize", "externalize_hint")
             for d in plan.decisions
-        )
+        ))
         trigger = {
             "force": bool(kwargs.get("force", False)),
             # Presence and length only: focus_topic is free text and must never
@@ -242,17 +318,20 @@ class ContextTunerEngine:
         try:
             if self._store is None:
                 self._store = RecoveryPointerStore(default_store_path())
-            pending_op = self._store.begin_compression(
-                old_session_id=self._session_id,
-                original_count=len(messages),
-                total_tokens=plan.total_tokens,
-                messages=messages,
-                decisions=[d.__dict__ for d in plan.decisions],
-                trigger=trigger,
-                threshold_tokens=context_budget,
-                tail_budget=tail_budget,
-                protected_head=protected_head,
-            )
+            # With no plan there is nothing truthful to journal: skip the write
+            # rather than record a row with zeroed totals.
+            if plan is not None:
+                pending_op = self._store.begin_compression(
+                    old_session_id=self._session_id,
+                    original_count=len(messages),
+                    total_tokens=plan.total_tokens,
+                    messages=messages,
+                    decisions=[d.__dict__ for d in plan.decisions],
+                    trigger=trigger,
+                    threshold_tokens=context_budget,
+                    tail_budget=tail_budget,
+                    protected_head=protected_head,
+                )
         except Exception:
             self._health["audit_failures"] += 1
             pending_op = None
@@ -309,13 +388,31 @@ class ContextTunerEngine:
             raise
 
         # ---- phase 2 bookkeeping: wait for host boundary to finalize ----
+        # The delegate has already produced a valid result. Wrapper-side
+        # bookkeeping must never turn that success into a host-visible
+        # exception: a raise here would discard a compression that worked.
+        # Compute first, then commit, so a partial failure never leaves a
+        # half-registered pending operation behind.
+        try:
+            count = len(result) if result is not None else 0
+            result_messages = list(result) if isinstance(result, (list, tuple)) else []
+            fingerprint = _fingerprint_messages(result_messages)
+            # The compression just performed counts toward the refresh cadence,
+            # and the rule reads this counter: it must advance *before* the rule
+            # is consulted or the cadence is off by one.
+            self._compressions_since_checkpoint += 1
+            hint = lossy and self._checkpoint_refresh_needed(current_tokens)
+        except Exception:
+            self._health["audit_failures"] += 1
+            self._pending_operation = None
+            self._pending_result_fingerprint = None
+            self._pending_checkpoint_hint = False
+            return result
         self._pending_operation = pending_op
-        self._pending_count = len(result) if result is not None else 0
-        result_messages = list(result) if isinstance(result, (list, tuple)) else []
-        self._pending_result_fingerprint = _fingerprint_messages(result_messages)
+        self._pending_count = count
+        self._pending_result_fingerprint = fingerprint
         self._pending_old_session_id = self._session_id
-        self._compressions_since_checkpoint += 1
-        self._pending_checkpoint_hint = lossy and self._checkpoint_refresh_needed(current_tokens)
+        self._pending_checkpoint_hint = hint
         return result
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:

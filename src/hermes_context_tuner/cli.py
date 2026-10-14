@@ -22,9 +22,38 @@ def _repo_root_from_hermes() -> Path:
     return Path.home() / "AppData" / "Local" / "hermes" / "hermes-agent"
 
 
+def _hermes_home() -> Path:
+    """Resolve the Hermes home dir the way Hermes itself does."""
+    env = os.environ.get("HERMES_HOME")
+    if env:
+        return Path(env)
+    win = Path.home() / "AppData" / "Local" / "hermes"
+    return win if win.is_dir() else Path.home() / ".hermes"
+
+
+def user_engine_dir(name: str = "context-tuner") -> Path:
+    """The user-plugin install target: ``$HERMES_HOME/plugins/<name>``.
+
+    Hermes resolves engines bundled-first and then from this user dir -- but a
+    *bundled* directory shadows the user dir even when it is empty, and the
+    bundled tree is runtime-owned: a Hermes upgrade can empty or replace it,
+    which is how an installed shim silently disappears. This directory is ours
+    and survives upgrades, so it is the default install target.
+    """
+    return _hermes_home() / "plugins" / name
+
+
 def install_engine(hermes_repo: str | None = None, set_config: bool = False) -> Path:
-    repo = Path(hermes_repo) if hermes_repo else _repo_root_from_hermes()
-    target = repo / "plugins" / "context_engine" / "context-tuner"
+    """Install or update the context-engine shim.
+
+    Defaults to the user-plugin dir (upgrade-resilient). Pass ``hermes_repo``
+    to install into a Hermes checkout's bundled tree instead -- note that a
+    bundled copy takes precedence over the user dir at load time.
+    """
+    if hermes_repo:
+        target = Path(hermes_repo) / "plugins" / "context_engine" / "context-tuner"
+    else:
+        target = user_engine_dir()
     target.mkdir(parents=True, exist_ok=True)
 
     source = Path(__file__).resolve().parent / "hermes_engine"
@@ -96,7 +125,12 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd")
 
     p_install = sub.add_parser("install-hermes", help="Install/update the Hermes context-engine shim")
-    p_install.add_argument("--hermes-repo", default=None)
+    p_install.add_argument(
+        "--hermes-repo",
+        default=None,
+        help="Install into a Hermes checkout's bundled tree instead of the "
+             "upgrade-resilient user-plugin dir ($HERMES_HOME/plugins/).",
+    )
     p_install.add_argument("--set-config", action="store_true", help="Set hermes config context.engine=context-tuner")
 
     p_cp = sub.add_parser("checkpoint", help="Write an explicit checkpoint from a JSON file (or stdin)")

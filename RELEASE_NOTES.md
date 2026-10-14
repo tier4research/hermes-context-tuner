@@ -1,3 +1,36 @@
+# v0.3.1
+
+Fail-open hardening of the compression wrapper. The wrapper now degrades to a
+passthrough instead of turning its own bookkeeping into a host-visible failure.
+
+## Fixed
+
+- **Budget planning is now inside the fail-open boundary.** `build_budget_plan`
+  ran before any try/except in `compress()`; a wrapper-side raise there denied
+  the host a compression it would otherwise have gotten. Planning failure now
+  degrades to a passthrough with no plan and is counted in
+  `health["audit_failures"]`.
+- **Post-delegate bookkeeping can no longer discard a successful compression.**
+  Fingerprinting and the checkpoint-refresh hint ran *after* the delegate had
+  already returned a valid result; a raise there propagated to the host and
+  threw the completed compression away. Bookkeeping is now compute-then-commit:
+  on failure the delegate's result is still returned, and no half-registered
+  pending operation is left behind.
+- **Orphan teardown is non-fatal.** A pending operation whose
+  `_close_pending_on_teardown` raise previously wedged the next `compress()`.
+  The unwedgeable orphan is now dropped and counted instead.
+- **No zeroed journal rows.** When planning fails there is nothing truthful to
+  journal, so the `started` row is skipped rather than written with zeroed
+  totals.
+
+## Notes
+
+- Reuses `health["audit_failures"]`; the health schema is unchanged.
+- The checkpoint-refresh cadence is unchanged: the counter still advances
+  before the rule that reads it (regression-covered).
+- Regression suite: `tests/test_fail_open_compress.py` (5 red-verified tests
+  plus a happy-path no-regression guard).
+
 # v0.3.0
 
 Context continuity journal: compression lineage you can trust, plus explicit
