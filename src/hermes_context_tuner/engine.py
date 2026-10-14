@@ -159,6 +159,40 @@ class ContextTunerEngine:
         # in-flight operation owned by another session is never swept.
         self._reconcile_stale_operations()
 
+    def _audit_failure(self) -> None:
+        """Count a wrapper-side audit failure without ever raising.
+
+        Error accounting is wrapper-owned bookkeeping: if it can raise, a
+        bookkeeping fault escalates into the host-visible failure this wrapper
+        exists to prevent (audit HIGH-3).
+        """
+        try:
+            health = self._health
+            health["audit_failures"] = int(health.get("audit_failures", 0) or 0) + 1
+        except Exception:
+            pass
+
+    def _terminalize_operation(self, operation_id: str | None, reason: str) -> None:
+        """Force a phase-1 journal row to a terminal state. Never raises.
+
+        The row is written *before* the delegate runs, so a post-success
+        bookkeeping fault must not merely drop the pointer: that leaves the row
+        'started' forever and falsifies the compute-then-commit claim
+        (audit HIGH-2, HIGH-13). "Interrupted" is the honest state, since the
+        compression itself succeeded but its completion could not be recorded.
+        """
+        if not operation_id or self._store is None:
+            return
+        try:
+            self._store.mark_interrupted_if_started(operation_id, reason=reason[:200])
+            return
+        except Exception:
+            pass
+        try:
+            self._store.fail_compression(operation_id, reason=reason[:200])
+        except Exception:
+            pass
+
     def _reconcile_stale_operations(self) -> None:
         """Close operations left in 'started' by a previous process death."""
         max_age = STALE_OPERATION_SECONDS
@@ -173,7 +207,7 @@ class ContextTunerEngine:
         try:
             self._store.interrupt_stale_started(max_age_seconds=max_age)
         except Exception:
-            self._health["audit_failures"] += 1
+            self._audit_failure()
 
     def _checkpoint_refresh_needed(self, current_tokens: int | None) -> bool:
         """Whether repeated lossy compression without an explicit checkpoint
@@ -269,7 +303,11 @@ class ContextTunerEngine:
         # the compression it would have gotten without this wrapper: degrade to
         # a passthrough with no plan instead of denying the operation.
         plan = None
-        context_budget = int(current_tokens or 128_000)
+        # Safe defaults first: converting caller-supplied tokens is wrapper
+        # work and must not run outside the fail-open boundary, or a hostile
+        # __int__/__bool__ denies a compression the delegate would have
+        # accepted (audit HIGH-4a).
+        context_budget = 128_000
         tail_budget = max(8_000, context_budget // 5)
         protected_head = 3
         try:
@@ -286,7 +324,7 @@ class ContextTunerEngine:
         except Exception:
             # No plan -> no audit journal for this compression, never no
             # compression. Reuses audit_failures to keep the health schema stable.
-            self._health["audit_failures"] += 1
+            self._audit_failure()
             plan = None
 
         # A previous operation still pending means its boundary callback never
@@ -298,23 +336,36 @@ class ContextTunerEngine:
                     "new compress() began before previous operation's boundary callback"
                 )
             except Exception:
-                self._health["audit_failures"] += 1
+                self._audit_failure()
                 self._pending_operation = None
 
         # ---- phase 1: open a 'started' journal operation (fail-open) ----
         pending_op: str | None = None
-        lossy = bool(plan is not None and any(
-            d.decision in ("summarize", "externalize_hint")
-            for d in plan.decisions
-        ))
-        trigger = {
-            "force": bool(kwargs.get("force", False)),
-            # Presence and length only: focus_topic is free text and must never
-            # be persisted into the sidecar.
-            "focus_topic_present": bool(focus_topic),
-            "focus_topic_chars": len(focus_topic) if focus_topic else 0,
-            "current_tokens": current_tokens,
-        }
+        lossy = False
+        trigger: dict[str, Any] = {}
+        # Plan inspection and trigger construction are wrapper work too: a
+        # malformed or extended plan object, or a non-string focus_topic, must
+        # degrade to "no plan" rather than deny the compression (audit
+        # HIGH-4b/4c). With no plan there is nothing truthful to journal, so
+        # the row is skipped entirely.
+        try:
+            lossy = bool(plan is not None and any(
+                d.decision in ("summarize", "externalize_hint")
+                for d in plan.decisions
+            ))
+            trigger = {
+                "force": bool(kwargs.get("force", False)),
+                # Presence and length only: focus_topic is free text and must
+                # never be persisted into the sidecar.
+                "focus_topic_present": bool(focus_topic),
+                "focus_topic_chars": len(focus_topic) if focus_topic else 0,
+                "current_tokens": current_tokens,
+            }
+        except Exception:
+            self._audit_failure()
+            plan = None
+            lossy = False
+            trigger = {}
         try:
             if self._store is None:
                 self._store = RecoveryPointerStore(default_store_path())
@@ -333,7 +384,7 @@ class ContextTunerEngine:
                     protected_head=protected_head,
                 )
         except Exception:
-            self._health["audit_failures"] += 1
+            self._audit_failure()
             pending_op = None
 
         # ---- delegate compression (contract preserved) ----
@@ -356,7 +407,7 @@ class ContextTunerEngine:
                         pending_op, reason="unsupported delegate signature"
                     )
                 except Exception:
-                    self._health["audit_failures"] += 1
+                    self._audit_failure()
             self._pending_operation = None
             raise
         except TypeError as exc:
@@ -371,7 +422,7 @@ class ContextTunerEngine:
                         reason=_safe_failure_reason(exc, "raised by compression delegate"),
                     )
                 except Exception:
-                    self._health["audit_failures"] += 1
+                    self._audit_failure()
             self._pending_operation = None
             raise DelegateCompressionError("Hermes compression delegate raised TypeError") from exc
         except Exception as exc:
@@ -383,7 +434,7 @@ class ContextTunerEngine:
                         reason=_safe_failure_reason(exc, "raised by compression delegate"),
                     )
                 except Exception:
-                    self._health["audit_failures"] += 1
+                    self._audit_failure()
             self._pending_operation = None
             raise
 
@@ -393,6 +444,9 @@ class ContextTunerEngine:
         # exception: a raise here would discard a compression that worked.
         # Compute first, then commit, so a partial failure never leaves a
         # half-registered pending operation behind.
+        count = 0
+        fingerprint = ""
+        hint = False
         try:
             count = len(result) if result is not None else 0
             result_messages = list(result) if isinstance(result, (list, tuple)) else []
@@ -403,16 +457,39 @@ class ContextTunerEngine:
             self._compressions_since_checkpoint += 1
             hint = lossy and self._checkpoint_refresh_needed(current_tokens)
         except Exception:
-            self._health["audit_failures"] += 1
-            self._pending_operation = None
-            self._pending_result_fingerprint = None
-            self._pending_checkpoint_hint = False
+            # The delegate succeeded, so the host still receives the
+            # compression. But the phase-1 row already exists: dropping only
+            # the in-memory pointer would leave it 'started' forever and make
+            # the compute-then-commit claim false (audit HIGH-2/brief HIGH-7).
+            # Terminalize it, then degrade. Nothing in this handler may raise.
+            try:
+                self._audit_failure()
+                self._terminalize_operation(
+                    pending_op, "post-delegate bookkeeping failed"
+                )
+                self._pending_operation = None
+                self._pending_result_fingerprint = None
+                self._pending_checkpoint_hint = False
+            except Exception:
+                pass
             return result
-        self._pending_operation = pending_op
-        self._pending_count = count
-        self._pending_result_fingerprint = fingerprint
-        self._pending_old_session_id = self._session_id
-        self._pending_checkpoint_hint = hint
+        try:
+            self._pending_operation = pending_op
+            self._pending_count = count
+            self._pending_result_fingerprint = fingerprint
+            self._pending_old_session_id = self._session_id
+            self._pending_checkpoint_hint = hint
+        except Exception:
+            # Publishing the pending pointer is bookkeeping: it must not
+            # discard a successful compression, and the row it would have
+            # pointed at must not be orphaned (audit HIGH-3, LOW-31).
+            try:
+                self._audit_failure()
+                self._terminalize_operation(
+                    pending_op, "pending-state publication failed"
+                )
+            except Exception:
+                pass
         return result
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
@@ -445,7 +522,7 @@ class ContextTunerEngine:
                         conversation_id=kwargs.get("conversation_id"),
                     )
                 except Exception as exc:
-                    self._health["audit_failures"] += 1
+                    self._audit_failure()
                     # Never leave an operation non-terminal: if the finalize
                     # write failed, close it as interrupted instead.
                     try:
@@ -456,7 +533,7 @@ class ContextTunerEngine:
                             ),
                         )
                     except Exception:
-                        self._health["audit_failures"] += 1
+                        self._audit_failure()
             else:
                 # Either a non-compression session start, or a boundary whose
                 # parent session does not match this operation: it can never be
@@ -470,7 +547,7 @@ class ContextTunerEngine:
                 try:
                     self._store.mark_interrupted_if_started(op, reason=reason)
                 except Exception:
-                    self._health["audit_failures"] += 1
+                    self._audit_failure()
             self._pending_operation = None
             self._pending_count = 0
             self._pending_result_fingerprint = None
@@ -492,7 +569,7 @@ class ContextTunerEngine:
                     op, reason=reason[:AUDIT_SUMMARY_CAP]
                 )
         except Exception:
-            self._health["audit_failures"] += 1
+            self._audit_failure()
         finally:
             self._pending_operation = None
             self._pending_count = 0

@@ -43,6 +43,103 @@ def user_engine_dir(name: str = "context-tuner") -> Path:
     return _hermes_home() / "plugins" / name
 
 
+def bundled_engine_dir(hermes_repo: str | Path | None = None) -> Path:
+    """Where a Hermes checkout keeps the *bundled* engine shim.
+
+    A bundled directory wins over the user dir merely by existing, so this is
+    the path that must be checked before any install is reported as successful.
+    """
+    root = Path(hermes_repo) if hermes_repo else _repo_root_from_hermes()
+    return Path(root) / "plugins" / "context_engine" / "context-tuner"
+
+
+_LOADER_PROBE = (
+    "import importlib.util as _iu, json, sys\n"
+    "_ha = sys.argv[1]\n"
+    "_spec = _iu.spec_from_file_location('_ct_ctx_engine', _ha + '/plugins/context_engine/__init__.py')\n"
+    "_m = _iu.module_from_spec(_spec)\n"
+    "_spec.loader.exec_module(_m)\n"
+    "_out = {'resolved': None, 'discover': []}\n"
+    "try:\n"
+    "    _r = _m.find_engine_dir('context-tuner')\n"
+    "    _out['resolved'] = str(_r) if _r is not None else None\n"
+    "except Exception as _e:\n"
+    "    _out['find_error'] = type(_e).__name__\n"
+    "try:\n"
+    "    _out['discover'] = [repr(_d) for _d in _m.discover_context_engines()]\n"
+    "except Exception as _e:\n"
+    "    _out['discover_error'] = type(_e).__name__\n"
+    "print(json.dumps(_out))\n"
+)
+
+
+def verify_install(target: Path, hermes_repo: str | Path | None = None) -> dict:
+    """Verify that the *loader* resolves the shim that was just installed.
+
+    Copying files is not installing. Hermes resolves engines bundled-first, so
+    a stale, partial or empty bundled directory silently shadows the user
+    install while the CLI still prints success -- the September outage exactly
+    (audit CRITICAL-1: a false-success deployment path). This probes the real
+    loader and reports fail-closed: any inability to prove the engine loads is
+    reported as failure, not as success.
+    """
+    target = Path(target).resolve()
+    report: dict = {
+        "ok": False,
+        "target": str(target),
+        "resolved": None,
+        "shadow": None,
+        "reasons": [],
+    }
+
+    bundled = bundled_engine_dir(hermes_repo)
+    shadow_exists = False
+    try:
+        shadow_exists = bundled.is_dir()
+    except Exception:
+        shadow_exists = False
+    if shadow_exists and bundled.resolve() != target:
+        report["shadow"] = str(bundled)
+        report["reasons"].append(
+            f"bundled shadow at {bundled} -- Hermes resolves it first, so "
+            f"{target} will not load"
+        )
+
+    root = Path(hermes_repo) if hermes_repo else _repo_root_from_hermes()
+    python = Path(root) / "venv" / "Scripts" / "python.exe"
+    if not python.is_file():
+        python = Path(sys.executable)
+    try:
+        proc = subprocess.run(
+            [str(python), "-c", _LOADER_PROBE, str(root)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        data = json.loads(lines[-1]) if lines else {}
+        resolved = data.get("resolved")
+        report["resolved"] = resolved
+        report["discover"] = data.get("discover")
+        if not resolved:
+            report["reasons"].append(
+                "loader reported no engine path "
+                f"(find_engine_dir -> None; {data.get('find_error') or 'no error reported'})"
+            )
+        elif Path(resolved).resolve() != target:
+            report["reasons"].append(
+                f"loader resolves {resolved}, not the installed target"
+            )
+    except Exception as exc:
+        report["reasons"].append(
+            f"could not probe the loader: {type(exc).__name__}: {exc}"
+        )
+
+    report["ok"] = not report["reasons"]
+    return report
+
+
 def install_engine(hermes_repo: str | None = None, set_config: bool = False) -> Path:
     """Install or update the context-engine shim.
 
@@ -145,8 +242,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "install-hermes":
         target = install_engine(args.hermes_repo, set_config=args.set_config)
-        print(f"installed context-tuner engine shim to {target}")
-        return 0
+        report = verify_install(target, args.hermes_repo)
+        if report["ok"]:
+            print(f"installed context-tuner engine shim to {target}")
+            print(f"verified: the loader resolves {report['resolved']}")
+            return 0
+        # Fail closed: an unverified install is not an install. Reporting
+        # success here is what let the shim disappear silently for 19 days.
+        print(f"copied context-tuner engine shim to {target}")
+        print("INSTALL VERIFICATION FAILED -- the engine will not load:")
+        for reason in report["reasons"]:
+            print(f"  - {reason}")
+        return 1
     if hasattr(args, "func"):
         return args.func(args)
 

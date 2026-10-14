@@ -1,3 +1,36 @@
+# v0.3.2
+
+Installer verification and journal-row honesty. Compression behaviour is
+unchanged; both defects were in what the wrapper -- and the installer --
+*claimed* about work they had not actually verified.
+
+## Fixed
+
+- **The installer no longer reports success it has not verified.** Hermes
+  resolves engine shims bundled-first, so a stale or empty bundled directory
+  shadows the user install while `install-hermes` still printed "installed".
+  The CLI now probes the real loader after copying and exits non-zero, naming
+  the reason, whenever the engine will not load (audit CRITICAL-1: a
+  false-success deployment path).
+- **No journal row is left `started` forever.** The phase-1 row is written
+  *before* the delegate runs, so a post-success bookkeeping fault must
+  terminalize that row instead of dropping only the in-memory pointer. The
+  earlier claim that "no half-registered pending operation is left behind" was
+  false (audit HIGH-2, HIGH-13).
+- **Error accounting can no longer escalate into a host-visible failure.** Every
+  `health["audit_failures"]` increment is replaced by a non-throwing
+  `_audit_failure()` helper, and plan inspection, trigger construction and
+  pending-state publication now sit inside the fail-open boundary (audit
+  HIGH-3, HIGH-4a/b/c).
+
+## Registered, not fixed
+
+The remaining findings are registered in the findings registry rather than
+silently deferred: permissive boundary correlation when session ids are absent
+(HIGH-9), delegate-result corruption reported as a bookkeeping failure (HIGH-7),
+and unmodelled operation concurrency (HIGH-8). Each needs a host-contract
+decision or a design change, not a patch under time pressure.
+
 # v0.3.1
 
 Fail-open hardening of the compression wrapper. The wrapper now degrades to a
