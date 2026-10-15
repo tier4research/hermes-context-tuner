@@ -27,6 +27,7 @@ jobs:
             MATCHES=$(grep -rn "$pattern" --include='*.py' --include='*.md' --include='*.txt' --include='*.json' --include='*.yaml' --include='*.yml' --include='*.toml' --include='*.cfg' --include='*.ini' . 2>/dev/null \
               | grep -v node_modules \
               | grep -v '.git/' \
+              | grep -v '.github/workflows/leak-check.yml' \
               || true)
             if [ -n "$MATCHES" ]; then
               echo "🔴 LEAK: pattern '$pattern' matched:"
